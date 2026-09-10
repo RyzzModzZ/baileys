@@ -1,0 +1,14 @@
+src
+tsconfig.json
+package-lock.json
+.eslintrc.json
+.prettierrc
+jest.config.js
+tests/
+auth_info/
+media/
+logs/
+*.log
+.DS_Store
+.env*
+node_modules/
