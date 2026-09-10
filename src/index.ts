@@ -7,7 +7,13 @@ import makeWASocket, {
   WAMessageContent,
   AnyMessageContent,
   ConnectionState,
-  Browsers
+  Browsers,
+  makeInMemoryStore,
+  downloadMediaMessage,
+  getContentType,
+  MessageType,
+  waMessageFromContact,
+  BufferJSON,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import * as fs from 'fs';
@@ -21,10 +27,12 @@ const CHANNEL_JID = '0029Vb9FLjYIN9im3Ip1Oj3p@newsletter'; // Auto-forward desti
 const AUTH_FOLDER = './auth_info';
 const MEDIA_FOLDER = './media';
 const LOG_FOLDER = './logs';
+const STORE_FILE = './baileys_store.json';
 
 // ==================== LOGGER SETUP ====================
 const logger = pino.default({ level: 'info', timestamp: pino.stdTimeFunctions.isoTime });
 const msgRetryCounterCache = new NodeCache.default();
+const store = makeInMemoryStore({ logger });
 
 // ==================== ENSURE DIRECTORIES ====================
 const ensureDirectories = () => {
@@ -44,17 +52,39 @@ const handleMessage = async (socket: WASocket, message: proto.IWebMessageInfo) =
     const chat = message.key.remoteJid!;
     const sender = message.key.participant || message.key.remoteJid!;
     const isGroup = chat.endsWith('@g.us');
-    const isBroadcast = chat.endsWith('@broadcast');
     const timestamp = new Date(message.messageTimestamp! * 1000);
 
     logger.info(`📨 Message from ${sender} in ${chat}`);
 
     // ==================== AUTO-FORWARD TO CHANNEL ====================
     try {
-      const messageText = message.message.conversation || 
-                         message.message.extendedTextMessage?.text || 
-                         '[Media Message]';
-      
+      const messageType = getContentType(message.message);
+      let messageText = '';
+
+      if (messageType === 'conversation') {
+        messageText = message.message.conversation || '';
+      } else if (messageType === 'extendedTextMessage') {
+        messageText = message.message.extendedTextMessage?.text || '';
+      } else if (messageType === 'imageMessage') {
+        messageText = `[Image] ${message.message.imageMessage?.caption || ''}`;
+      } else if (messageType === 'videoMessage') {
+        messageText = `[Video] ${message.message.videoMessage?.caption || ''}`;
+      } else if (messageType === 'audioMessage') {
+        messageText = '[Audio Message]';
+      } else if (messageType === 'documentMessage') {
+        messageText = `[Document] ${message.message.documentMessage?.fileName || ''}`;
+      } else if (messageType === 'locationMessage') {
+        messageText = '[Location Shared]';
+      } else if (messageType === 'contactMessage') {
+        messageText = '[Contact Shared]';
+      } else if (messageType === 'stickerMessage') {
+        messageText = '[Sticker]';
+      } else if (messageType === 'pollCreationMessage') {
+        messageText = `[Poll] ${message.message.pollCreationMessage?.name || 'Poll'}`;
+      } else {
+        messageText = `[${messageType || 'Unknown'}]`;
+      }
+
       const senderInfo = isGroup 
         ? await socket.groupMetadata(chat).then(meta => {
             const participant = meta.participants.find(p => p.id === sender);
@@ -70,13 +100,6 @@ const handleMessage = async (socket: WASocket, message: proto.IWebMessageInfo) =
       logger.warn(`⚠ Failed to forward message to channel: ${err}`);
     }
 
-    // ==================== AUTO-REPLY ====================
-    if (message.message.conversation?.toLowerCase().includes('ping')) {
-      await socket.sendMessage(chat, { 
-        text: '🏓 Pong! Bot is alive!' 
-      }, { quoted: message });
-    }
-
   } catch (error) {
     logger.error(`❌ Error handling message: ${error}`);
   }
@@ -86,7 +109,7 @@ const handleMessage = async (socket: WASocket, message: proto.IWebMessageInfo) =
 const handleMessageUpdate = async (socket: WASocket, update: proto.IMessageUpdate) => {
   for (const { key, update: msgUpdate } of update.updates ?? []) {
     if (msgUpdate.pollUpdates) {
-      const pollCreation = await socket.getMessage(key);
+      const pollCreation = await store.loadMessage(key);
       if (pollCreation?.message?.pollCreationMessage) {
         logger.info(`📊 Poll update received`);
       }
@@ -129,7 +152,7 @@ const startBot = async () => {
     const socket = makeWASocket({
       auth: state,
       printQRInTerminal: true,
-      browser: Browsers.ubuntu('Chrome'),
+      browser: Browsers.ubuntu('WhatsApp Bot'),
       msgRetryCounterCache,
       logger,
       version: await fetchLatestWAWebVersion(),
@@ -140,7 +163,11 @@ const startBot = async () => {
       retryRequestDelayMs: 10,
       fireInitQueries: false,
       emitOwnEventsOnly: false,
+      defaultQueryTimeoutMs: undefined,
     });
+
+    // Bind store
+    store.bind(socket.ev);
 
     // ==================== EVENT LISTENERS ====================
     
@@ -182,13 +209,23 @@ const startBot = async () => {
 
     // Handle presence updates
     socket.ev.on('presence.update', (update) => {
-      logger.info(`🟢 Presence update: ${update.id} - ${update.presences}`);
+      logger.info(`🟢 Presence update: ${update.id}`);
     });
 
     // Handle call updates
     socket.ev.on('call', async (calls) => {
       logger.info(`📞 Incoming call from ${calls[0].from}`);
     });
+
+    // Save store periodically
+    setInterval(() => {
+      store.writeToFile(STORE_FILE);
+    }, 10000);
+
+    // Load store from file
+    if (fs.existsSync(STORE_FILE)) {
+      store.readFromFile(STORE_FILE);
+    }
 
     logger.info(`🚀 Bot started successfully!`);
     return socket;
@@ -199,7 +236,7 @@ const startBot = async () => {
   }
 };
 
-// ==================== HELPER FUNCTIONS ====================
+// ==================== HELPER FUNCTIONS - MESSAGING ====================
 
 /**
  * Send text message
@@ -216,11 +253,10 @@ export const sendText = async (socket: WASocket, jid: string, text: string, quot
 /**
  * Send image with caption
  */
-export const sendImage = async (socket: WASocket, jid: string, imagePath: string, caption?: string) => {
+export const sendImage = async (socket: WASocket, jid: string, imagePath: string | Buffer | { url: string }, caption?: string) => {
   try {
-    const imageBuffer = fs.readFileSync(imagePath);
     await socket.sendMessage(jid, {
-      image: imageBuffer,
+      image: imagePath,
       caption: caption || ''
     });
     logger.info(`✓ Image sent to ${jid}`);
@@ -232,13 +268,13 @@ export const sendImage = async (socket: WASocket, jid: string, imagePath: string
 /**
  * Send video with caption
  */
-export const sendVideo = async (socket: WASocket, jid: string, videoPath: string, caption?: string) => {
+export const sendVideo = async (socket: WASocket, jid: string, videoPath: string | Buffer | { url: string }, caption?: string, ptv?: boolean) => {
   try {
-    const videoBuffer = fs.readFileSync(videoPath);
     await socket.sendMessage(jid, {
-      video: videoBuffer,
+      video: videoPath,
       caption: caption || '',
-      mimetype: 'video/mp4'
+      mimetype: 'video/mp4',
+      ptv: ptv || false
     });
     logger.info(`✓ Video sent to ${jid}`);
   } catch (err) {
@@ -249,13 +285,12 @@ export const sendVideo = async (socket: WASocket, jid: string, videoPath: string
 /**
  * Send audio message
  */
-export const sendAudio = async (socket: WASocket, jid: string, audioPath: string) => {
+export const sendAudio = async (socket: WASocket, jid: string, audioPath: string | Buffer | { url: string }, ptt?: boolean) => {
   try {
-    const audioBuffer = fs.readFileSync(audioPath);
     await socket.sendMessage(jid, {
-      audio: audioBuffer,
+      audio: audioPath,
       mimetype: 'audio/mpeg',
-      ptt: false
+      ptt: ptt || false
     });
     logger.info(`✓ Audio sent to ${jid}`);
   } catch (err) {
@@ -266,17 +301,32 @@ export const sendAudio = async (socket: WASocket, jid: string, audioPath: string
 /**
  * Send document/file
  */
-export const sendDocument = async (socket: WASocket, jid: string, filePath: string, fileName?: string) => {
+export const sendDocument = async (socket: WASocket, jid: string, filePath: string | Buffer | { url: string }, fileName?: string, mimetype?: string) => {
   try {
-    const fileBuffer = fs.readFileSync(filePath);
     await socket.sendMessage(jid, {
-      document: fileBuffer,
-      fileName: fileName || path.basename(filePath),
-      mimetype: 'application/octet-stream'
+      document: filePath,
+      fileName: fileName || 'document',
+      mimetype: mimetype || 'application/octet-stream'
     });
     logger.info(`✓ Document sent to ${jid}`);
   } catch (err) {
     logger.error(`❌ Failed to send document: ${err}`);
+  }
+};
+
+/**
+ * Send GIF (as video with gifPlayback)
+ */
+export const sendGif = async (socket: WASocket, jid: string, gifPath: string | Buffer | { url: string }, caption?: string) => {
+  try {
+    await socket.sendMessage(jid, {
+      video: gifPath,
+      caption: caption || '',
+      gifPlayback: true
+    });
+    logger.info(`✓ GIF sent to ${jid}`);
+  } catch (err) {
+    logger.error(`❌ Failed to send GIF: ${err}`);
   }
 };
 
@@ -293,7 +343,7 @@ export const sendButtonMessage = async (
   try {
     await socket.sendMessage(jid, {
       text,
-      footer: footer || 'Bot Footer',
+      footer: footer || 'Bot',
       buttons: buttons.map(btn => ({
         buttonId: btn.buttonId,
         buttonText: { displayText: btn.buttonText },
@@ -314,7 +364,8 @@ export const sendListMessage = async (
   socket: WASocket,
   jid: string,
   title: string,
-  rows: Array<{ rowId: string; title: string; description?: string }>
+  rows: Array<{ rowId: string; title: string; description?: string }>,
+  buttonText?: string
 ) => {
   try {
     await socket.sendMessage(jid, {
@@ -328,7 +379,8 @@ export const sendListMessage = async (
             description: row.description || ''
           }))
         }
-      ]
+      ],
+      buttonText: buttonText || 'Select'
     });
     logger.info(`✓ List message sent to ${jid}`);
   } catch (err) {
@@ -367,16 +419,15 @@ export const sendContact = async (
   socket: WASocket,
   jid: string,
   displayName: string,
-  phoneNumber: string
+  phoneNumber: string,
+  organization?: string
 ) => {
   try {
-    const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${displayName}\nTEL:${phoneNumber}\nEND:VCARD`;
+    const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${displayName}\nTEL:${phoneNumber}${organization ? `\nORG:${organization}` : ''}\nEND:VCARD`;
     await socket.sendMessage(jid, {
       contacts: {
         displayName,
-        contacts: [{
-          vcard
-        }]
+        contacts: [{ vcard }]
       }
     });
     logger.info(`✓ Contact sent to ${jid}`);
@@ -392,14 +443,15 @@ export const sendPoll = async (
   socket: WASocket,
   jid: string,
   question: string,
-  options: string[]
+  options: string[],
+  selectableCount?: number
 ) => {
   try {
     await socket.sendMessage(jid, {
       poll: {
         name: question,
         values: options,
-        selectableCount: 1
+        selectableCount: selectableCount || 1
       }
     });
     logger.info(`✓ Poll sent to ${jid}`);
@@ -407,6 +459,78 @@ export const sendPoll = async (
     logger.error(`❌ Failed to send poll: ${err}`);
   }
 };
+
+/**
+ * Send message with link preview
+ */
+export const sendLinkPreview = async (socket: WASocket, jid: string, url: string, text?: string) => {
+  try {
+    await socket.sendMessage(jid, {
+      text: text || url
+    });
+    logger.info(`✓ Link preview message sent to ${jid}`);
+  } catch (err) {
+    logger.error(`❌ Failed to send link preview: ${err}`);
+  }
+};
+
+/**
+ * Send reaction to message
+ */
+export const sendReaction = async (socket: WASocket, jid: string, messageKey: proto.IMessageKey, emoji: string) => {
+  try {
+    await socket.sendMessage(jid, {
+      react: {
+        text: emoji,
+        key: messageKey
+      }
+    });
+    logger.info(`✓ Reaction sent to ${jid}`);
+  } catch (err) {
+    logger.error(`❌ Failed to send reaction: ${err}`);
+  }
+};
+
+/**
+ * Forward message
+ */
+export const forwardMessage = async (socket: WASocket, jid: string, message: proto.IWebMessageInfo) => {
+  try {
+    await socket.sendMessage(jid, { forward: message });
+    logger.info(`✓ Message forwarded to ${jid}`);
+  } catch (err) {
+    logger.error(`❌ Failed to forward message: ${err}`);
+  }
+};
+
+/**
+ * Delete message for everyone
+ */
+export const deleteMessage = async (socket: WASocket, jid: string, messageKey: proto.IMessageKey) => {
+  try {
+    await socket.sendMessage(jid, { delete: messageKey });
+    logger.info(`✓ Message deleted from ${jid}`);
+  } catch (err) {
+    logger.error(`❌ Failed to delete message: ${err}`);
+  }
+};
+
+/**
+ * Edit message
+ */
+export const editMessage = async (socket: WASocket, jid: string, messageKey: proto.IMessageKey, newText: string) => {
+  try {
+    await socket.sendMessage(jid, {
+      text: newText,
+      edit: messageKey
+    });
+    logger.info(`✓ Message edited in ${jid}`);
+  } catch (err) {
+    logger.error(`❌ Failed to edit message: ${err}`);
+  }
+};
+
+// ==================== HELPER FUNCTIONS - GROUP MANAGEMENT ====================
 
 /**
  * Create group
@@ -490,7 +614,7 @@ export const demoteGroupMembers = async (
 };
 
 /**
- * Update group subject
+ * Update group subject (name)
  */
 export const updateGroupSubject = async (
   socket: WASocket,
@@ -547,6 +671,46 @@ export const getGroupMetadata = async (socket: WASocket, groupJid: string) => {
 };
 
 /**
+ * Get group invite code
+ */
+export const getGroupInviteCode = async (socket: WASocket, groupJid: string) => {
+  try {
+    const code = await socket.groupInviteCode(groupJid);
+    logger.info(`✓ Group invite code: ${code}`);
+    return code;
+  } catch (err) {
+    logger.error(`❌ Failed to get invite code: ${err}`);
+  }
+};
+
+/**
+ * Revoke group invite code
+ */
+export const revokeGroupInviteCode = async (socket: WASocket, groupJid: string) => {
+  try {
+    await socket.groupRevokeInvite(groupJid);
+    logger.info(`✓ Group invite code revoked`);
+  } catch (err) {
+    logger.error(`❌ Failed to revoke invite code: ${err}`);
+  }
+};
+
+/**
+ * Join group via invite code
+ */
+export const joinGroupByCode = async (socket: WASocket, inviteCode: string) => {
+  try {
+    const groupId = await socket.groupAcceptInvite(inviteCode);
+    logger.info(`✓ Joined group: ${groupId}`);
+    return groupId;
+  } catch (err) {
+    logger.error(`❌ Failed to join group: ${err}`);
+  }
+};
+
+// ==================== HELPER FUNCTIONS - PROFILE & CONTACTS ====================
+
+/**
  * Get user profile picture
  */
 export const getUserProfilePicture = async (
@@ -577,27 +741,90 @@ export const getUserStatus = async (socket: WASocket, jid: string) => {
 };
 
 /**
- * Update user profile
+ * Check if number exists on WhatsApp
  */
-export const updateUserProfile = async (
-  socket: WASocket,
-  updates: {
-    pushName?: string;
-    status?: string;
-  }
-) => {
+export const checkNumberExists = async (socket: WASocket, number: string) => {
   try {
-    if (updates.pushName) {
-      await socket.updateProfileName(updates.pushName);
-    }
-    if (updates.status) {
-      await socket.updateProfileStatus(updates.status);
-    }
-    logger.info(`✓ Profile updated`);
+    const [result] = await socket.onWhatsApp(number);
+    logger.info(`✓ Number existence checked`);
+    return result;
   } catch (err) {
-    logger.error(`❌ Failed to update profile: ${err}`);
+    logger.error(`❌ Failed to check number: ${err}`);
   }
 };
+
+/**
+ * Update user profile name
+ */
+export const updateProfileName = async (
+  socket: WASocket,
+  name: string
+) => {
+  try {
+    await socket.updateProfileName(name);
+    logger.info(`✓ Profile name updated to: ${name}`);
+  } catch (err) {
+    logger.error(`❌ Failed to update profile name: ${err}`);
+  }
+};
+
+/**
+ * Update user profile status
+ */
+export const updateProfileStatus = async (
+  socket: WASocket,
+  status: string
+) => {
+  try {
+    await socket.updateProfileStatus(status);
+    logger.info(`✓ Profile status updated`);
+  } catch (err) {
+    logger.error(`❌ Failed to update profile status: ${err}`);
+  }
+};
+
+/**
+ * Update user profile picture
+ */
+export const updateProfilePicture = async (
+  socket: WASocket,
+  imagePath: string | Buffer | { url: string }
+) => {
+  try {
+    await socket.updateProfilePicture(socket.user!.id, imagePath);
+    logger.info(`✓ Profile picture updated`);
+  } catch (err) {
+    logger.error(`❌ Failed to update profile picture: ${err}`);
+  }
+};
+
+/**
+ * Get all contacts
+ */
+export const getContacts = async (socket: WASocket) => {
+  try {
+    const contacts = store.contacts;
+    logger.info(`✓ Contacts fetched`);
+    return contacts;
+  } catch (err) {
+    logger.error(`❌ Failed to get contacts: ${err}`);
+  }
+};
+
+/**
+ * Get all chats
+ */
+export const getChats = async (socket: WASocket) => {
+  try {
+    const chats = store.chats.all();
+    logger.info(`✓ ${chats.length} chats fetched`);
+    return chats;
+  } catch (err) {
+    logger.error(`❌ Failed to get chats: ${err}`);
+  }
+};
+
+// ==================== HELPER FUNCTIONS - PRESENCE & STATUS ====================
 
 /**
  * Set presence status (typing, recording, etc.)
@@ -605,7 +832,7 @@ export const updateUserProfile = async (
 export const setPresence = async (
   socket: WASocket,
   jid: string,
-  status: 'typing' | 'recording' | 'paused'
+  status: 'typing' | 'recording' | 'paused' | 'available' | 'unavailable'
 ) => {
   try {
     await socket.sendPresenceUpdate(status, jid);
@@ -616,59 +843,91 @@ export const setPresence = async (
 };
 
 /**
- * Revoke message
+ * Subscribe to presence updates
  */
-export const revokeMessage = async (socket: WASocket, message: proto.IWebMessageInfo) => {
+export const subscribeToPresence = async (socket: WASocket, jid: string) => {
   try {
-    await socket.sendMessage(message.key.remoteJid!, {
-      delete: message.key
-    });
-    logger.info(`✓ Message revoked`);
+    await socket.presenceSubscribe(jid);
+    logger.info(`✓ Subscribed to presence updates for ${jid}`);
   } catch (err) {
-    logger.error(`❌ Failed to revoke message: ${err}`);
+    logger.error(`❌ Failed to subscribe: ${err}`);
   }
 };
 
-/**
- * Get chats
- */
-export const getChats = async (socket: WASocket) => {
-  try {
-    const chats = socket.store.chats.all();
-    logger.info(`✓ ${chats.length} chats fetched`);
-    return chats;
-  } catch (err) {
-    logger.error(`❌ Failed to get chats: ${err}`);
-  }
-};
-
-/**
- * Get contacts
- */
-export const getContacts = async (socket: WASocket) => {
-  try {
-    const contacts = socket.store.contacts;
-    logger.info(`✓ Contacts fetched`);
-    return contacts;
-  } catch (err) {
-    logger.error(`❌ Failed to get contacts: ${err}`);
-  }
-};
+// ==================== HELPER FUNCTIONS - CHAT MANAGEMENT ====================
 
 /**
  * Mark chat as read
  */
 export const markChatAsRead = async (socket: WASocket, jid: string) => {
   try {
-    await socket.readMessages([
-      {
-        remoteJid: jid,
-        id: 'all'
-      }
-    ]);
+    await socket.readMessages([{ remoteJid: jid, id: 'all' }]);
     logger.info(`✓ Chat marked as read`);
   } catch (err) {
     logger.error(`❌ Failed to mark as read: ${err}`);
+  }
+};
+
+/**
+ * Archive chat
+ */
+export const archiveChat = async (socket: WASocket, jid: string) => {
+  try {
+    const lastMsg = store.loadMessage(jid);
+    if (lastMsg) {
+      await socket.chatModify({ archive: true, lastMessages: [lastMsg] }, jid);
+      logger.info(`✓ Chat archived`);
+    }
+  } catch (err) {
+    logger.error(`❌ Failed to archive chat: ${err}`);
+  }
+};
+
+/**
+ * Mute/Unmute chat
+ */
+export const muteChat = async (socket: WASocket, jid: string, muteMs?: number) => {
+  try {
+    await socket.chatModify({ mute: muteMs || 8 * 60 * 60 * 1000 }, jid);
+    logger.info(`✓ Chat muted`);
+  } catch (err) {
+    logger.error(`❌ Failed to mute chat: ${err}`);
+  }
+};
+
+/**
+ * Unmute chat
+ */
+export const unmuteChat = async (socket: WASocket, jid: string) => {
+  try {
+    await socket.chatModify({ mute: null }, jid);
+    logger.info(`✓ Chat unmuted`);
+  } catch (err) {
+    logger.error(`❌ Failed to unmute chat: ${err}`);
+  }
+};
+
+/**
+ * Pin chat
+ */
+export const pinChat = async (socket: WASocket, jid: string) => {
+  try {
+    await socket.chatModify({ pin: true }, jid);
+    logger.info(`✓ Chat pinned`);
+  } catch (err) {
+    logger.error(`❌ Failed to pin chat: ${err}`);
+  }
+};
+
+/**
+ * Unpin chat
+ */
+export const unpinChat = async (socket: WASocket, jid: string) => {
+  try {
+    await socket.chatModify({ pin: false }, jid);
+    logger.info(`✓ Chat unpinned`);
+  } catch (err) {
+    logger.error(`❌ Failed to unpin chat: ${err}`);
   }
 };
 
@@ -677,14 +936,111 @@ export const markChatAsRead = async (socket: WASocket, jid: string) => {
  */
 export const deleteChat = async (socket: WASocket, jid: string) => {
   try {
-    const chats = socket.store.chats.all();
+    const chats = store.chats.all();
     const chat = chats.find(c => c.id === jid);
     if (chat) {
-      socket.store.chats.delete(jid);
+      store.chats.delete(jid);
       logger.info(`✓ Chat deleted`);
     }
   } catch (err) {
     logger.error(`❌ Failed to delete chat: ${err}`);
+  }
+};
+
+/**
+ * Clear all messages in chat
+ */
+export const clearChatMessages = async (socket: WASocket, jid: string) => {
+  try {
+    await socket.chatModify({ clear: { messages: [] } }, jid);
+    logger.info(`✓ Chat cleared`);
+  } catch (err) {
+    logger.error(`❌ Failed to clear chat: ${err}`);
+  }
+};
+
+// ==================== HELPER FUNCTIONS - PRIVACY ====================
+
+/**
+ * Block user
+ */
+export const blockUser = async (socket: WASocket, jid: string) => {
+  try {
+    await socket.updateBlockStatus(jid, 'block');
+    logger.info(`✓ User blocked: ${jid}`);
+  } catch (err) {
+    logger.error(`❌ Failed to block user: ${err}`);
+  }
+};
+
+/**
+ * Unblock user
+ */
+export const unblockUser = async (socket: WASocket, jid: string) => {
+  try {
+    await socket.updateBlockStatus(jid, 'unblock');
+    logger.info(`✓ User unblocked: ${jid}`);
+  } catch (err) {
+    logger.error(`❌ Failed to unblock user: ${err}`);
+  }
+};
+
+/**
+ * Get block list
+ */
+export const getBlockList = async (socket: WASocket) => {
+  try {
+    const blocklist = await socket.fetchBlocklist();
+    logger.info(`✓ Blocklist fetched`);
+    return blocklist;
+  } catch (err) {
+    logger.error(`❌ Failed to fetch blocklist: ${err}`);
+  }
+};
+
+// ==================== HELPER FUNCTIONS - MEDIA ====================
+
+/**
+ * Download media from message
+ */
+export const downloadMedia = async (
+  socket: WASocket,
+  message: proto.IWebMessageInfo,
+  savePath?: string
+) => {
+  try {
+    const messageType = getContentType(message.message);
+    if (!messageType || !['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(messageType)) {
+      logger.warn(`Message type not supported for download: ${messageType}`);
+      return;
+    }
+
+    const stream = await downloadMediaMessage(message, 'stream', {}, {
+      logger,
+      reuploadRequest: socket.updateMediaMessage
+    });
+
+    if (savePath) {
+      const writeStream = fs.createWriteStream(savePath);
+      stream.pipe(writeStream);
+      logger.info(`✓ Media saved to ${savePath}`);
+    }
+
+    return stream;
+  } catch (err) {
+    logger.error(`❌ Failed to download media: ${err}`);
+  }
+};
+
+/**
+ * Reject incoming call
+ */
+export const rejectCall = async (socket: WASocket, callId: string, callFrom: string) => {
+  try {
+    await socket.rejectCall(callId, callFrom);
+    logger.info(`✓ Call rejected`);
+  } catch (err) {
+    logger.error(`❌ Failed to reject call: ${err}`);
   }
 };
 
